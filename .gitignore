@@ -25,10 +25,5 @@ spark-warehouse/
 
 *.log
 
-outputs/figures/*.png
-outputs/figures/*.jpg
-outputs/results/*.json
-outputs/results/*.txt
-
 !.gitkeep
 
