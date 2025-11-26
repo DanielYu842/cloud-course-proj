@@ -1,0 +1,551 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{parskip}
+
+% Page geometry - single column
+\geometry{
+    a4paper,
+    left=25mm,
+    right=25mm,
+    top=25mm,
+    bottom=25mm
+}
+
+% Hyperref setup
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,
+    urlcolor=cyan,
+}
+
+% Title
+\title{\textbf{Airbnb Price Predictor \& Trends: A Spark-Based Analysis of Pricing Patterns Across Global Cities}}
+\author{COMP4651 Cloud Computing Project Report}
+\date{November 2025}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+This project uses Apache Spark to analyze and predict Airbnb rental prices across three major cities: New York City, Los Angeles, and Paris. We processed over 173,000 listings from the Inside Airbnb dataset, created 16 new features, and trained machine learning models to predict nightly prices. Our best model, Gradient Boosted Trees, achieved an R\textsuperscript{2} of 0.619 with an RMSE of \$61.86. We also tested different Spark configurations and found that caching provides a 1.65x speedup for model training. This report describes our methods, results, and insights about what factors affect Airbnb pricing.
+\end{abstract}
+
+% ============================================================================
+% 1. INTRODUCTION
+% ============================================================================
+\section{Introduction}
+
+\subsection{Motivation}
+Airbnb has become one of the largest platforms for short-term rentals, with over 7 million listings worldwide. Setting the right price is a challenge for hosts because many factors affect what guests are willing to pay, including location, property size, amenities, and host reputation.
+
+Understanding what drives rental prices is useful for several reasons. Hosts can use this information to price their listings competitively. Travelers can better evaluate whether a listing is fairly priced. This project gave us the opportunity to apply the distributed computing concepts from COMP4651 to a real-world dataset.
+
+\subsection{Problem Statement}
+This project has two main goals:
+\begin{enumerate}[noitemsep]
+    \item Build a machine learning pipeline to predict Airbnb nightly prices based on listing characteristics
+    \item Evaluate how different Spark configurations affect performance for ML workloads
+\end{enumerate}
+
+\subsection{Objectives}
+Our specific objectives are:
+\begin{itemize}[noitemsep]
+    \item Load and clean Airbnb data from multiple cities using Spark DataFrames
+    \item Identify which features have the strongest relationship with price
+    \item Train and compare different regression models using Spark MLlib
+    \item Run experiments on partitioning and caching to understand their impact on performance
+\end{itemize}
+
+\subsection{Dataset Overview}
+We used the Inside Airbnb open dataset (\url{http://insideairbnb.com}), which contains listing information scraped from Airbnb's website. We selected three cities for our analysis:
+\begin{itemize}[noitemsep]
+    \item \textbf{New York City}: 36,111 listings
+    \item \textbf{Los Angeles}: 45,886 listings
+    \item \textbf{Paris}: 91,031 listings
+\end{itemize}
+
+The combined dataset contains 173,028 listings with 76 columns, including location coordinates, property details, host information, pricing, and reviews.
+
+% ============================================================================
+% 2. SYSTEM DESIGN
+% ============================================================================
+\section{System Design}
+
+\subsection{Architecture Overview}
+We ran Spark locally on our development machines. The project is organized into six Jupyter notebooks, with each notebook handling one stage of the pipeline:
+
+\begin{figure}[H]
+    \centering
+    \fbox{\parbox{0.9\textwidth}{
+        \centering
+        \textbf{Data Pipeline}\\[0.5em]
+        Raw CSV $\rightarrow$ Data Ingestion $\rightarrow$ Data Cleaning $\rightarrow$ Feature Engineering\\
+        $\rightarrow$ EDA $\rightarrow$ Model Training $\rightarrow$ Performance Experiments
+    }}
+    \caption{Six-stage data processing pipeline}
+    \label{fig:pipeline}
+\end{figure}
+
+\subsection{Technology Stack}
+We used the following tools:
+\begin{itemize}[noitemsep]
+    \item \textbf{Apache Spark 3.5.0}: Distributed data processing framework
+    \item \textbf{PySpark}: Python API for Spark
+    \item \textbf{Spark MLlib}: Machine learning library
+    \item \textbf{Parquet}: Columnar file format for intermediate storage
+    \item \textbf{Jupyter Notebooks}: Development environment
+    \item \textbf{Matplotlib/Seaborn}: Visualization libraries
+\end{itemize}
+
+\subsection{Spark Configuration}
+We configured Spark with these settings:
+\begin{itemize}[noitemsep]
+    \item Master: \texttt{local[*]} (uses all available CPU cores)
+    \item Driver Memory: 4GB
+    \item Executor Memory: 4GB
+    \item Shuffle Partitions: 16
+    \item Adaptive Query Execution: Enabled
+\end{itemize}
+
+\subsection{Data Storage}
+We saved intermediate data as Parquet files between pipeline stages. Parquet is well-suited for this use case because it uses columnar storage for efficient queries, provides built-in compression, preserves data types, and integrates well with Spark.
+
+% ============================================================================
+% 3. IMPLEMENTATION
+% ============================================================================
+\section{Implementation}
+
+\subsection{Data Ingestion}
+The first step was loading CSV files from all three cities and combining them into a single dataset. We used Spark's CSV reader with schema inference:
+
+\begin{verbatim}
+df = spark.read \
+    .option("header", True) \
+    .option("inferSchema", True) \
+    .option("escape", "\"") \
+    .option("multiLine", True) \
+    .csv(path)
+\end{verbatim}
+
+The datasets had slightly different schemas (NYC and LA had 80 columns, Paris had 76). We identified the 76 common columns and used those for the combined dataset. We also added a ``city'' column to track which city each listing came from.
+
+\subsection{Data Cleaning}
+The raw data required several cleaning steps:
+
+\textbf{Price Parsing}: The price column contained formatted strings like ``\$1,500.00''. We removed the dollar signs and commas to convert to numeric values:
+\begin{verbatim}
+df = df.withColumn("price_clean",
+    regexp_replace(col("price"), "[$,]", "").cast("float"))
+\end{verbatim}
+
+\textbf{Invalid Price Removal}: We removed listings with missing, zero, or extremely high prices (over \$100,000), as these likely represent errors.
+
+\textbf{Missing Value Handling}: We used different strategies depending on the column:
+\begin{itemize}[noitemsep]
+    \item Bedrooms: Filled with median value for that property type
+    \item Beds: Estimated as accommodates divided by 2
+    \item Review scores: Filled with the overall median (4.87)
+    \item Host response rate: Converted from percentage string, defaulted to 0 if missing
+\end{itemize}
+
+\textbf{Boolean Conversion}: Columns like ``host\_is\_superhost'' had values ``t'' and ``f'', which we converted to 1 and 0.
+
+\textbf{Bathrooms Parsing}: The bathrooms column contained text like ``1.5 shared baths''. We used regex to extract the numeric value.
+
+After cleaning, the dataset was reduced from 173,028 to 118,240 listings.
+
+\subsection{Feature Engineering}
+We created 16 new features to improve model performance:
+
+\textbf{Host Features}:
+\begin{itemize}[noitemsep]
+    \item \texttt{host\_tenure\_days}: Days since host registration
+    \item \texttt{host\_tenure\_years}: Years since host registration
+\end{itemize}
+
+\textbf{Review Features}:
+\begin{itemize}[noitemsep]
+    \item \texttt{review\_density}: Reviews per month normalized by availability
+    \item \texttt{reviews\_per\_year\_hosting}: Total reviews divided by hosting tenure
+\end{itemize}
+
+\textbf{Capacity Features}:
+\begin{itemize}[noitemsep]
+    \item \texttt{occupancy\_rate}: Estimated occupancy based on availability
+    \item \texttt{people\_per\_bedroom}: Guest capacity divided by bedrooms
+    \item \texttt{people\_per\_bed}: Guest capacity divided by beds
+\end{itemize}
+
+\textbf{Location Features}:
+We calculated the distance from each listing to the city center using the Haversine formula:
+\begin{equation}
+d = 2R \arcsin\left(\sqrt{\sin^2\left(\frac{\Delta\phi}{2}\right) + \cos(\phi_1)\cos(\phi_2)\sin^2\left(\frac{\Delta\lambda}{2}\right)}\right)
+\end{equation}
+where $R = 6371$ km is the Earth's radius. We defined city centers as Times Square (NYC), Hollywood (LA), and the Eiffel Tower (Paris).
+
+\textbf{Price Features}:
+\begin{itemize}[noitemsep]
+    \item \texttt{price\_per\_person}: Price divided by guest capacity
+    \item \texttt{price\_per\_bedroom}: Price divided by number of bedrooms
+    \item \texttt{price\_index}: Listing price relative to neighborhood average
+\end{itemize}
+
+\textbf{Neighborhood Features}:
+\begin{itemize}[noitemsep]
+    \item \texttt{neighborhood\_avg\_price}: Average price in the neighborhood
+    \item \texttt{neighborhood\_listing\_count}: Number of listings in the neighborhood
+\end{itemize}
+
+\textbf{Composite Features}:
+\begin{itemize}[noitemsep]
+    \item \texttt{host\_performance\_score}: Combination of response rate, superhost status, and tenure
+    \item \texttt{property\_category}: Simplified property types into 6 categories
+    \item \texttt{min\_nights\_category}: Grouped minimum nights into short-term, weekly, long-term, and monthly
+\end{itemize}
+
+\subsection{Machine Learning Pipeline}
+We built the ML pipeline using Spark MLlib:
+\begin{enumerate}[noitemsep]
+    \item Selected 20 numeric features and 6 categorical features
+    \item Used StringIndexer to convert categorical variables to numeric indices
+    \item Used VectorAssembler to combine all features into a single vector
+    \item Split the data 80/20 for training and testing (seed=42 for reproducibility)
+\end{enumerate}
+
+% ============================================================================
+% 4. EXPERIMENTS AND RESULTS
+% ============================================================================
+\section{Experiments and Results}
+
+\subsection{Exploratory Data Analysis}
+
+\subsubsection{Price Distribution}
+We analyzed how prices vary across cities. The data contained some extreme outliers, so we applied IQR-based outlier removal. After this step, 108,251 listings remained.
+
+\begin{table}[H]
+\centering
+\caption{Price Statistics by City (After Outlier Removal)}
+\label{tab:price_stats}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{City} & \textbf{Count} & \textbf{Mean Price} & \textbf{Median Price} & \textbf{Std Dev} \\
+\midrule
+New York City & 19,669 & \$179.06 & \$125.00 & \$89.12 \\
+Los Angeles & 33,768 & \$166.76 & \$120.00 & \$86.45 \\
+Paris & 54,814 & \$166.18 & \$120.00 & \$78.23 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+New York City has the highest average prices, which is consistent with its expensive real estate market. Paris has the most listings (52.6\% of the dataset) but similar pricing to Los Angeles.
+
+\subsubsection{Room Type Analysis}
+Room type has a significant effect on pricing:
+
+\begin{table}[H]
+\centering
+\caption{Price by Room Type}
+\label{tab:room_type}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Room Type} & \textbf{Count} & \textbf{Avg Price} \\
+\midrule
+Entire home/apt & 84,985 & \$178.42 \\
+Private room & 18,562 & \$89.56 \\
+Hotel room & 1,286 & \$156.78 \\
+Shared room & 418 & \$67.34 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Entire homes and apartments make up 78.5\% of listings and have the highest average prices. Shared rooms are the least expensive option.
+
+\subsubsection{Superhost Impact}
+We examined whether superhost status affects pricing. Superhosts charge only 1.3\% more on average than regular hosts. However, they have higher review scores (4.89 vs. 4.71) and more reviews (42.3 vs. 28.1 on average). This suggests that superhost status leads to more bookings rather than higher prices.
+
+\subsubsection{Feature Correlations}
+We calculated correlations between features and price:
+
+\begin{table}[H]
+\centering
+\caption{Features Most Correlated with Price}
+\label{tab:correlations}
+\begin{tabular}{lr}
+\toprule
+\textbf{Feature} & \textbf{Correlation} \\
+\midrule
+price\_per\_person & 0.552 \\
+accommodates & 0.495 \\
+bedrooms & 0.429 \\
+beds & 0.416 \\
+bathrooms & 0.321 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The strongest correlations are with capacity-related features. Larger properties that accommodate more guests tend to have higher prices.
+
+\subsubsection{Distance to City Center}
+We analyzed how location affects pricing:
+
+\begin{table}[H]
+\centering
+\caption{Price by Distance to City Center}
+\label{tab:distance}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Distance} & \textbf{Count} & \textbf{Avg Price} \\
+\midrule
+0-2 km & 18,234 & \$182.45 \\
+2-5 km & 42,567 & \$168.32 \\
+5-10 km & 31,892 & \$158.76 \\
+10-20 km & 12,456 & \$162.18 \\
+20+ km & 3,102 & \$189.34 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Listings near city centers command higher prices. The 20+ km category also shows high prices, likely because these are larger vacation properties or estates.
+
+\subsection{Machine Learning Results}
+
+\subsubsection{Model Comparison}
+We trained and compared three regression models:
+
+\begin{table}[H]
+\centering
+\caption{Model Performance Comparison}
+\label{tab:models}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Model} & \textbf{RMSE (\$)} & \textbf{MAE (\$)} & \textbf{R\textsuperscript{2}} \\
+\midrule
+Linear Regression & 79.59 & 59.19 & 0.370 \\
+Random Forest (50 trees) & 64.89 & 46.71 & 0.581 \\
+Gradient Boosted Trees & 61.86 & 43.66 & 0.619 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Linear Regression served as our baseline with an R\textsuperscript{2} of 0.370. The lower performance suggests that the relationship between features and price is non-linear.
+
+Random Forest improved significantly, achieving an R\textsuperscript{2} of 0.581. This model can capture more complex patterns in the data.
+
+Gradient Boosted Trees performed best with an R\textsuperscript{2} of 0.619 and RMSE of \$61.86. This is a 22\% improvement over Linear Regression.
+
+\subsubsection{Feature Importance}
+The GBT model provided feature importance scores:
+
+\begin{table}[H]
+\centering
+\caption{Top 10 Feature Importances (GBT Model)}
+\label{tab:importance}
+\begin{tabular}{lr}
+\toprule
+\textbf{Feature} & \textbf{Importance} \\
+\midrule
+bedrooms & 0.112 \\
+distance\_to\_center & 0.105 \\
+longitude & 0.102 \\
+latitude & 0.094 \\
+minimum\_nights & 0.072 \\
+review\_scores\_rating & 0.066 \\
+accommodates & 0.055 \\
+host\_response\_rate & 0.052 \\
+host\_listings\_count & 0.049 \\
+city\_index & 0.045 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Number of bedrooms is the most important feature, followed by location-related features (distance, longitude, latitude). This confirms that both property size and location are key factors in pricing.
+
+\subsubsection{Prediction Accuracy}
+We analyzed the prediction errors:
+\begin{itemize}[noitemsep]
+    \item Mean absolute error: \$43.66
+    \item Median absolute error: \$30.95
+    \item 68.97\% of predictions within \$50 of actual price
+    \item Mean percentage error: 29.6\%
+\end{itemize}
+
+The model performs well for typical listings but has larger errors for expensive properties (over \$500/night), where there is less training data.
+
+\subsection{Spark Performance Experiments}
+
+We ran four experiments to evaluate Spark's performance characteristics for ML workloads.
+
+\subsubsection{Experiment 1: Partitioning Impact}
+We measured how the number of partitions affects model training time:
+
+\begin{table}[H]
+\centering
+\caption{Training Time vs. Partition Count}
+\label{tab:partitions}
+\begin{tabular}{rrr}
+\toprule
+\textbf{Partitions} & \textbf{Training Time (s)} & \textbf{RMSE (\$)} \\
+\midrule
+4 & 1.49 & 79.08 \\
+8 & 0.62 & 78.97 \\
+16 & 0.53 & 78.87 \\
+32 & 0.63 & 78.91 \\
+64 & 1.04 & 79.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The optimal performance was at 16 partitions. With too few partitions (4), the work is not distributed efficiently. With too many partitions (64), the overhead of managing tasks becomes significant. Model accuracy (RMSE) remained consistent across all partition counts.
+
+\subsubsection{Experiment 2: Caching Impact}
+We tested the effect of caching when training multiple models:
+
+\begin{table}[H]
+\centering
+\caption{Caching Impact on Training Time}
+\label{tab:caching}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Method} & \textbf{Avg Time/Model (s)} & \textbf{Total Time (s)} \\
+\midrule
+Without Cache & 0.35 & 1.04 \\
+With Cache & 0.21 & 0.63 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Caching provided a \textbf{1.65x speedup}. This benefit would be larger for workflows that train many models, such as hyperparameter tuning or cross-validation.
+
+\subsubsection{Experiment 3: Model Complexity}
+We examined how the number of trees affects training time and accuracy:
+
+\begin{table}[H]
+\centering
+\caption{Training Time vs. Number of Trees}
+\label{tab:complexity}
+\begin{tabular}{rrr}
+\toprule
+\textbf{Trees} & \textbf{Training Time (s)} & \textbf{RMSE (\$)} \\
+\midrule
+10 & 0.22 & 80.03 \\
+30 & 0.40 & 80.66 \\
+50 & 0.68 & 79.61 \\
+100 & 1.01 & 79.51 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Training time increases roughly linearly with the number of trees. However, accuracy only improves slightly (from \$80.03 to \$79.51 RMSE). The 100-tree model takes 4.6x longer for a \$0.52 improvement, showing diminishing returns.
+
+\subsubsection{Experiment 4: Dataset Scaling}
+We measured how training time scales with dataset size:
+
+\begin{table}[H]
+\centering
+\caption{Training Time vs. Dataset Size}
+\label{tab:scaling}
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Data \%} & \textbf{Train Rows} & \textbf{Training Time (s)} & \textbf{RMSE (\$)} \\
+\midrule
+10\% & 8,658 & 0.20 & 78.54 \\
+25\% & 21,736 & 0.25 & 78.42 \\
+50\% & 43,273 & 0.33 & 78.93 \\
+75\% & 64,837 & 0.43 & 79.46 \\
+100\% & 86,203 & 0.49 & 78.21 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Training time scales sub-linearly with data size. A 10x increase in data only results in a 2.5x increase in training time. The average throughput was about 176,000 rows per second.
+
+% ============================================================================
+% 5. CONCLUSIONS
+% ============================================================================
+\section{Conclusions}
+
+\subsection{Key Findings}
+
+\subsubsection{Pricing Insights}
+Our analysis revealed several factors that affect Airbnb pricing:
+\begin{enumerate}[noitemsep]
+    \item \textbf{Property size is most important}: Number of bedrooms, bathrooms, and guest capacity have the strongest relationship with price.
+    
+    \item \textbf{Location affects price}: Listings closer to city centers are 8-15\% more expensive. However, some distant properties are also expensive, likely vacation homes.
+    
+    \item \textbf{Prices are similar across cities}: NYC, LA, and Paris have similar median prices (\$120-125), despite different markets.
+    
+    \item \textbf{Superhost status has limited pricing impact}: Superhosts charge only 1.3\% more, but they receive more reviews, suggesting more bookings.
+\end{enumerate}
+
+\subsubsection{Model Performance}
+Our Gradient Boosted Trees model achieved:
+\begin{itemize}[noitemsep]
+    \item R\textsuperscript{2} of 0.619 (explains 62\% of price variation)
+    \item Average error of \$43.66
+    \item 69\% of predictions within \$50 of actual price
+\end{itemize}
+
+The remaining variation is likely due to factors we could not measure, such as photo quality, description text, and seasonal demand.
+
+\subsubsection{Spark Performance}
+Our experiments showed:
+\begin{itemize}[noitemsep]
+    \item 16 partitions was optimal for our dataset size
+    \item Caching provides 1.65x speedup for iterative workloads
+    \item Training time scales sub-linearly with data size (10x data = 2.5x time)
+    \item Average throughput of 176,000 rows/second
+\end{itemize}
+
+\subsection{Limitations}
+This project has several limitations:
+\begin{enumerate}[noitemsep]
+    \item \textbf{Local execution}: Running on a single machine limits the scalability benefits of Spark.
+    
+    \item \textbf{Static data}: We used a single snapshot and did not account for seasonal price changes.
+    
+    \item \textbf{Limited features}: We did not include text analysis of descriptions or image analysis of photos.
+    
+    \item \textbf{Three cities only}: Results may not generalize to other markets.
+\end{enumerate}
+
+\subsection{Future Work}
+Possible extensions include:
+\begin{itemize}[noitemsep]
+    \item \textbf{Calendar data}: Use availability data to predict dynamic pricing
+    \item \textbf{Text analysis}: Apply NLP to listing descriptions and reviews
+    \item \textbf{Deep learning}: Try neural networks for potentially better accuracy
+    \item \textbf{Cluster deployment}: Run on a distributed cluster to test true scalability
+    \item \textbf{More cities}: Add additional markets to improve generalization
+\end{itemize}
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+\section*{References}
+\begin{enumerate}[noitemsep]
+    \item Inside Airbnb. (2024). Get the Data. \url{http://insideairbnb.com/get-the-data}
+    
+    \item Apache Spark. (2024). Spark Documentation. \url{https://spark.apache.org/docs/latest/}
+\end{enumerate}
+
+\end{document}
